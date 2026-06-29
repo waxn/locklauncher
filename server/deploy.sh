@@ -1,42 +1,30 @@
 #!/usr/bin/env bash
-# deploy.sh — sync server to VPS and restart service
+# deploy.sh — pull latest code on the VPS and restart the service
 #
-# First-time VPS setup (run once as root):
-#   apt update && apt install -y python3-pip python3-venv ufw
-#   ufw allow 22 && ufw allow 8080 && ufw enable
-#   useradd -r -s /bin/false locklauncher
-#   mkdir -p /opt/locklauncher && chown locklauncher:locklauncher /opt/locklauncher
-#   echo "API_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(24))')" > /opt/locklauncher/.env
-#   chmod 600 /opt/locklauncher/.env
-#   chown locklauncher:locklauncher /opt/locklauncher/.env
-#   cp locklauncher.service /etc/systemd/system/
+# First-time VPS setup (run once as root on the server):
+#   apt update && apt install -y python3-venv ufw git
+#   ufw allow 22 && ufw allow 47291 && ufw enable
+#   cd /locklauncher
+#   python3 -m venv /locklauncher/venv
+#   venv/bin/pip install -r server/requirements.txt
+#   echo "API_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(24))')" > /locklauncher/.env
+#   chmod 600 /locklauncher/.env
+#   cp server/locklauncher.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now locklauncher
 #
-# After first-time setup, just run this script to redeploy.
+# After first-time setup, push your changes, then run this script to redeploy.
 
 set -euo pipefail
 
-SSH_USER="root"        # SSH user on the VPS (root or admin account)
-VPS_HOST="your.vps.ip" # <-- fill in your VPS IP or hostname
-REMOTE_DIR="/opt/locklauncher"
+SSH_USER="root"         # SSH user on the VPS
+VPS_HOST="your.vps.ip"  # <-- fill in your VPS IP or hostname
 
-echo "Syncing server code to ${VPS_HOST}..."
-rsync -av \
-  --exclude="*.pyc" \
-  --exclude="__pycache__/" \
-  --exclude=".env" \
-  --exclude="lock_state.json" \
-  --exclude="*.tmp" \
-  "$(dirname "$0")/" "${SSH_USER}@${VPS_HOST}:${REMOTE_DIR}/"
-
-echo "Installing dependencies and restarting service..."
+echo "Deploying to ${VPS_HOST}..."
 ssh "${SSH_USER}@${VPS_HOST}" bash <<'REMOTE'
   set -euo pipefail
-  cd /opt/locklauncher
-  if [ ! -d venv ]; then
-    python3 -m venv venv
-  fi
-  venv/bin/pip install -q -r requirements.txt
+  cd /locklauncher
+  git pull
+  venv/bin/pip install -q -r server/requirements.txt
   systemctl restart locklauncher
   systemctl is-active locklauncher
   echo "Deploy complete."

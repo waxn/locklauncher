@@ -3,10 +3,9 @@ Description=LockLauncher lock server
 After=network.target
 
 [Service]
-User=locklauncher
-WorkingDirectory=/opt/locklauncher
-EnvironmentFile=/opt/locklauncher/.env
-ExecStart=/opt/locklauncher/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8080
+WorkingDirectory=/locklauncher/server
+EnvironmentFile=/locklauncher/.env
+ExecStart=/locklauncher/venv/bin/uvicorn main:app --host 0.0.0.0 --port 47291
 Restart=always
 RestartSec=3
 
