@@ -1,4 +1,5 @@
 import configparser
+import hashlib
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import time
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import messagebox, simpledialog
+from tkinter import filedialog, messagebox, simpledialog
 
 import requests
 
@@ -63,6 +64,30 @@ def save_user_name(name: str) -> None:
     user_dir = _localappdata() / "LockLauncher"
     user_dir.mkdir(parents=True, exist_ok=True)
     (user_dir / "user.json").write_text(json.dumps({"name": name}))
+
+
+# ---------------------------------------------------------------------------
+# File path override (persisted per-device; lets a user point LockLauncher at
+# a different file location without rebuilding the exe)
+# ---------------------------------------------------------------------------
+
+def _settings_file() -> Path:
+    return _localappdata() / "LockLauncher" / "settings.json"
+
+
+def load_file_override() -> Path | None:
+    try:
+        data = json.loads(_settings_file().read_text())
+        path = data.get("file_path")
+        return Path(path) if path else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def save_file_override(path: Path) -> None:
+    settings_dir = _localappdata() / "LockLauncher"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    _settings_file().write_text(json.dumps({"file_path": str(path)}))
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +187,35 @@ def post_lock(server_url: str, api_key: str, name: str) -> bool:
     return True
 
 
-def delete_lock(server_url: str, api_key: str) -> None:
+def delete_lock(server_url: str, api_key: str, file_hash: str | None = None) -> None:
     requests.delete(
         f"{server_url}/lock",
         headers={"X-API-Key": api_key},
+        json={"hash": file_hash},
         timeout=5,
     ).raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# File hashing (used to detect a stale Proton Drive sync before opening)
+# ---------------------------------------------------------------------------
+
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hash_file_with_retry(path: Path, attempts: int = 5, delay: float = 1.0) -> str | None:
+    """Excel can briefly hold the file right after closing; retry a few times."""
+    for _ in range(attempts):
+        try:
+            return _hash_file(path)
+        except OSError:
+            time.sleep(delay)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -191,10 +239,15 @@ def _watch_and_release(excel_path: Path, server_url: str, api_key: str) -> None:
     while lock_file.exists():
         time.sleep(0.5)
 
+    # Let the filesystem settle, then hash the final saved file so the next
+    # opener can detect whether their local Proton Drive copy has synced.
+    time.sleep(1)
+    file_hash = _hash_file_with_retry(excel_path)
+
     # Release the server lock, retrying on transient network failures
     while True:
         try:
-            delete_lock(server_url, api_key)
+            delete_lock(server_url, api_key, file_hash=file_hash)
             return
         except Exception:
             time.sleep(10)
@@ -230,6 +283,34 @@ def _open_readonly_copy(excel_path: Path) -> None:
     _open(tmp)
 
 
+def _check_version_or_warn(excel_path: Path, last_hash: str | None) -> bool:
+    """
+    Confirms the local file matches the hash recorded the last time the lock
+    was released cleanly. Returns True if it's safe to proceed, False if the
+    user gave up waiting for Proton Drive to sync.
+    """
+    if not last_hash:
+        return True
+
+    while True:
+        try:
+            local_hash = _hash_file(excel_path)
+        except OSError:
+            local_hash = None
+
+        if local_hash == last_hash:
+            return True
+
+        if not messagebox.askretrycancel(
+            "LockLauncher — Wrong Version",
+            f"This computer's copy of {excel_path.name} doesn't match the\n"
+            "version that was just saved on the other device.\n\n"
+            "Proton Drive is probably still syncing. Wait a few seconds,\n"
+            "then click Retry — or Cancel to try again later.",
+        ):
+            return False
+
+
 def _open_edit_copy(excel_path: Path) -> None:
     desktop = Path.home() / "Desktop"
     ts = datetime.now().strftime("%Y%m%d_%H%M")
@@ -254,6 +335,29 @@ def _prompt_name(root: tk.Tk) -> str | None:
         parent=root,
     )
     return name.strip() if name and name.strip() else None
+
+
+def _run_settings_dialog(current_path: Path | None) -> Path | None:
+    """
+    Lets the user pick which Excel file LockLauncher should manage, overriding
+    the filename baked into config.ini. Returns the new path, or None if
+    cancelled. Run via `LockLauncher.exe --settings`.
+    """
+    messagebox.showinfo(
+        "LockLauncher Settings",
+        "Choose the shared Excel file LockLauncher should manage.",
+    )
+    chosen = filedialog.askopenfilename(
+        title="Select the shared Excel file",
+        filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")],
+        initialdir=str(current_path.parent) if current_path else str(_exe_dir()),
+    )
+    if not chosen:
+        return None
+    new_path = Path(chosen)
+    save_file_override(new_path)
+    messagebox.showinfo("LockLauncher Settings", f"Saved:\n{new_path}")
+    return new_path
 
 
 def _show_locked_dialog(root: tk.Tk, status: dict) -> str:
@@ -297,7 +401,12 @@ def _show_locked_dialog(root: tk.Tk, status: dict) -> str:
         ("Cancel", "cancel"),
     ]
     for label, val in buttons:
-        tk.Button(frame, text=label, width=24, command=lambda v=val: pick(v)).pack(pady=3)
+        style = (
+            dict(bg="#c0392b", fg="white", activebackground="#a93226", activeforeground="white")
+            if val == "release"
+            else {}
+        )
+        tk.Button(frame, text=label, width=24, command=lambda v=val: pick(v), **style).pack(pady=3)
 
     dialog.wait_window()
     return choice.get()
@@ -336,19 +445,36 @@ def main() -> None:
     root = tk.Tk()
     root.withdraw()
 
+    # `LockLauncher.exe --settings` opens a file picker to change which file
+    # is managed, without needing to rebuild the exe. Make a shortcut with
+    # this flag appended to the target for easy access.
+    if any(arg in ("--settings", "/settings") for arg in sys.argv[1:]):
+        _run_settings_dialog(load_file_override())
+        sys.exit(0)
+
     cfg = load_config()
     server_url = cfg["server"]["url"].rstrip("/")
     api_key = cfg["server"]["api_key"]
     excel_name = cfg["file"]["name"]
-    excel_path = _exe_dir() / excel_name
+    default_path = _exe_dir() / excel_name
+
+    override = load_file_override()
+    excel_path = override if override else default_path
 
     # Verify the Excel file is reachable
     if not excel_path.exists():
-        messagebox.showerror(
+        if messagebox.askyesno(
             "LockLauncher",
-            f"Cannot find:\n{excel_path}\n\nMake sure Proton Drive is mounted.",
-        )
-        sys.exit(1)
+            f"Cannot find:\n{excel_path}\n\n"
+            "Make sure Proton Drive is mounted, or locate the file now?",
+        ):
+            picked = _run_settings_dialog(excel_path)
+            if not picked or not picked.exists():
+                messagebox.showerror("LockLauncher", "File still not found.")
+                sys.exit(1)
+            excel_path = picked
+        else:
+            sys.exit(1)
 
     # Ensure we have a user name
     name = load_user_name()
@@ -374,6 +500,9 @@ def main() -> None:
     # Main loop — handles the (rare) race where we try to acquire a just-locked file
     while True:
         if not status.get("locked"):
+            if not _check_version_or_warn(excel_path, status.get("last_hash")):
+                sys.exit(0)
+
             try:
                 acquired = _do_acquire_and_open(server_url, api_key, name, excel_path)
             except Exception as e:
@@ -407,9 +536,13 @@ def main() -> None:
         elif action == "release":
             try:
                 delete_lock(server_url, api_key)
+                status = fetch_status(server_url)
             except Exception as e:
                 messagebox.showerror("LockLauncher — Could Not Release Lock", _describe_error(e, server_url))
                 sys.exit(1)
+
+            if not _check_version_or_warn(excel_path, status.get("last_hash")):
+                sys.exit(0)
 
             try:
                 acquired = _do_acquire_and_open(server_url, api_key, name, excel_path)

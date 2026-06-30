@@ -16,10 +16,12 @@ app = FastAPI(title="LockLauncher")
 def load_state() -> dict:
     try:
         if STATE_FILE.exists():
-            return json.loads(STATE_FILE.read_text())
+            state = json.loads(STATE_FILE.read_text())
+            state.setdefault("last_hash", None)
+            return state
     except (json.JSONDecodeError, OSError):
         pass
-    return {"locked": False, "locked_by": None, "locked_at": None}
+    return {"locked": False, "locked_by": None, "locked_at": None, "last_hash": None}
 
 
 def save_state(state: dict) -> None:
@@ -35,6 +37,10 @@ def require_api_key(x_api_key: str = Header(...)):
 
 class LockRequest(BaseModel):
     name: str
+
+
+class ReleaseRequest(BaseModel):
+    hash: str | None = None
 
 
 @app.get("/health")
@@ -57,13 +63,23 @@ def acquire_lock(req: LockRequest, _=Depends(require_api_key)):
             "locked": True,
             "locked_by": req.name,
             "locked_at": datetime.now(timezone.utc).isoformat(),
+            "last_hash": state.get("last_hash"),
         }
         save_state(new_state)
         return {"ok": True}
 
 
 @app.delete("/lock")
-def release_lock(_=Depends(require_api_key)):
+def release_lock(req: ReleaseRequest | None = None, _=Depends(require_api_key)):
     with _state_lock:
-        save_state({"locked": False, "locked_by": None, "locked_at": None})
+        state = load_state()
+        save_state({
+            "locked": False,
+            "locked_by": None,
+            "locked_at": None,
+            # A clean close (file watcher) sends the hash of the file it just
+            # saved. A forced release (stale lock override) sends none, so
+            # the previously recorded hash is left in place.
+            "last_hash": req.hash if (req and req.hash) else state.get("last_hash"),
+        })
         return {"ok": True}

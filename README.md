@@ -7,7 +7,11 @@ and it checks the lock, opens the file, and releases the lock automatically
 when you close Excel.
 
 **The Excel file itself never touches the server.** The server only ever
-stores `{locked, locked_by, locked_at}` — no file content, no file path.
+stores `{locked, locked_by, locked_at, last_hash}` — no file content, no
+file path. `last_hash` is a SHA-256 of the file, recorded when the lock is
+released cleanly, used to catch the case where Proton Drive hasn't finished
+syncing before the next person opens the file (see
+[Version-mismatch detection](#version-mismatch-detection) below).
 
 ```
 [User's PC]                         [VPS — Debian]
@@ -117,12 +121,12 @@ curl -s http://<vps-ip>:47291/status | python3 -m json.tool
 
 ### API reference
 
-| Method | Path      | Auth        | Body                | Description          |
-|--------|-----------|-------------|----------------------|-----------------------|
-| GET    | `/health` | none        | —                     | Liveness check        |
-| GET    | `/status` | none        | —                     | Current lock state    |
-| POST   | `/lock`   | `X-API-Key` | `{"name": "Alice"}`  | Acquire lock (409 if already locked) |
-| DELETE | `/lock`   | `X-API-Key` | —                     | Release lock           |
+| Method | Path      | Auth        | Body                          | Description          |
+|--------|-----------|-------------|---------------------------------|-----------------------|
+| GET    | `/health` | none        | —                               | Liveness check        |
+| GET    | `/status` | none        | —                               | `{locked, locked_by, locked_at, last_hash}` |
+| POST   | `/lock`   | `X-API-Key` | `{"name": "Alice"}`            | Acquire lock (409 if already locked) |
+| DELETE | `/lock`   | `X-API-Key` | `{"hash": "..."}` (optional)   | Release lock; hash is recorded as `last_hash` if provided |
 
 ---
 
@@ -176,8 +180,9 @@ Whenever the VPS IP, API key, or Excel filename changes, edit
    the lock is released automatically — no extra action needed.
 4. If the file **is locked**, you'll see who has it and for how long, with
    four options:
-   - **Release Lock & Open** — force-clears a stale lock (e.g. the other
-     user's app crashed) and opens the file for editing.
+   - **Release Lock & Open** (shown in red — this overrides someone else's
+     active session) — force-clears a stale lock (e.g. the other user's app
+     crashed) and opens the file for editing.
    - **Open Read-Only** — opens a temporary copy for viewing only.
    - **Edit a Copy** — saves a timestamped copy to your Desktop and opens
      it. Changes here do **not** sync back to the shared file automatically.
@@ -191,6 +196,44 @@ file and deletes the moment it closes it. This file lives in the same
 (possibly cloud-synced) folder, but LockLauncher only ever reads it on the
 local machine — it never depends on that file syncing across Proton Drive.
 When it disappears, LockLauncher tells the server to release the lock.
+
+### Version-mismatch detection
+
+The lock alone doesn't guarantee Proton Drive has actually finished
+syncing the other person's edits to your machine before you open the
+file — sync can lag well behind the lock being released. To catch this:
+
+- When LockLauncher detects Excel has closed the file, it hashes the
+  (now-saved) file and sends that hash to the server along with the
+  release.
+- The next time anyone tries to open the file, LockLauncher hashes its own
+  **local** copy first and compares it to the server's recorded hash.
+- If they don't match, your local copy hasn't synced yet. You'll see a
+  **"Wrong Version"** dialog telling you to wait for Proton Drive to catch
+  up, with **Retry** and **Cancel** buttons — no lock is taken and the file
+  is not opened until the hashes agree.
+
+This check runs whenever LockLauncher is about to open the file for
+editing, including after using **Release Lock & Open**. It does not apply
+to **Open Read-Only** or **Edit a Copy**, since those are already explicit
+"I know this might not be current" actions.
+
+### Changing which file LockLauncher manages
+
+By default LockLauncher manages the file named in `config.ini`, in the
+same folder as the exe. To point it at a different file (e.g. it moved, or
+got renamed) without rebuilding:
+
+```
+LockLauncher.exe --settings
+```
+
+This opens a file picker; the choice is saved to
+`%LOCALAPPDATA%\LockLauncher\settings.json` and overrides `config.ini` from
+then on for that device. (Make a desktop shortcut to `LockLauncher.exe`
+with `--settings` appended to the Target field for quick access.) If
+LockLauncher can't find the configured file at startup, it will offer to
+open this picker automatically.
 
 ---
 
@@ -218,3 +261,9 @@ needed.
 happen if the app was killed before the watcher thread could release the
 lock (e.g. a forced shutdown). Use **Release Lock & Open** from the locked
 dialog to clear it.
+
+**"Wrong Version" dialog won't go away even after waiting** — Proton Drive
+sync may be stalled. Check the Proton Drive client is running and signed
+in, and that the folder shows as synced (not "syncing...") on both
+machines. As a last resort, manually verify the file's modified time looks
+recent before clicking Retry again.
