@@ -8,7 +8,7 @@ REM
 REM Output: dist\LockLauncher.exe — copy this into the shared drive folder.
 
 echo Installing dependencies...
-pip install -r requirements.txt
+py -m pip install -r requirements.txt
 if errorlevel 1 (
     echo ERROR: pip install failed.
     pause
@@ -17,7 +17,7 @@ if errorlevel 1 (
 
 echo.
 echo Building LockLauncher.exe...
-pyinstaller ^
+py -m PyInstaller ^
     --onefile ^
     --windowed ^
     --add-data "config.ini;." ^
