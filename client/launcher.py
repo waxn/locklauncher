@@ -66,6 +66,79 @@ def save_user_name(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Error messages
+# ---------------------------------------------------------------------------
+
+def _describe_error(e: Exception, server_url: str) -> str:
+    """Turn a requests exception into a detailed, actionable message."""
+    if isinstance(e, requests.exceptions.MissingSchema):
+        return (
+            f"The server URL in config.ini looks malformed:\n{server_url}\n\n"
+            "It should look like: http://203.0.113.5:47291"
+        )
+
+    if isinstance(e, requests.exceptions.ConnectTimeout):
+        return (
+            f"Timed out trying to reach:\n{server_url}\n\n"
+            "The server may be down, or a firewall is blocking the connection.\n"
+            "Double-check the IP and port in config.ini."
+        )
+
+    if isinstance(e, requests.exceptions.ReadTimeout):
+        return (
+            f"Connected to {server_url} but it did not respond in time.\n\n"
+            "The server process may be hung or overloaded. Try again, or check\n"
+            "its status with: systemctl status locklauncher"
+        )
+
+    if isinstance(e, requests.exceptions.SSLError):
+        return f"SSL/TLS error connecting to:\n{server_url}\n\n{e}"
+
+    if isinstance(e, requests.exceptions.ConnectionError):
+        cause = str(e)
+        if any(s in cause for s in ("NameResolutionError", "getaddrinfo failed", "Name or service not known")):
+            return (
+                f"Could not resolve the server address in:\n{server_url}\n\n"
+                "Check that the IP/hostname in config.ini is correct and that\n"
+                "this machine has internet access."
+            )
+        if "Connection refused" in cause:
+            return (
+                f"Connection refused by:\n{server_url}\n\n"
+                "The server process may not be running, or the port number is\n"
+                "wrong. On the server, check: systemctl status locklauncher"
+            )
+        if "timed out" in cause.lower():
+            return (
+                f"Timed out trying to reach:\n{server_url}\n\n"
+                "The server may be down, or a firewall (e.g. ufw) is blocking\n"
+                "the port. On the server, check: ufw status"
+            )
+        return (
+            f"Could not connect to:\n{server_url}\n\n"
+            "Check your internet connection and that the server is running.\n\n"
+            f"Details: {cause}"
+        )
+
+    if isinstance(e, requests.exceptions.HTTPError):
+        status = e.response.status_code if e.response is not None else "?"
+        if status == 401:
+            return (
+                "The server rejected the API key.\n\n"
+                "Check that api_key in config.ini matches the API_KEY value in\n"
+                "the server's .env file, then rebuild the exe."
+            )
+        body = ""
+        try:
+            body = e.response.text[:200]
+        except Exception:
+            pass
+        return f"Server returned an error (HTTP {status}) from:\n{server_url}\n\n{body}"
+
+    return f"Unexpected error talking to:\n{server_url}\n\n{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Server calls
 # ---------------------------------------------------------------------------
 
@@ -289,10 +362,11 @@ def main() -> None:
     # Fetch current lock status
     try:
         status = fetch_status(server_url)
-    except Exception:
+    except Exception as e:
+        detail = _describe_error(e, server_url)
         if messagebox.askyesno(
             "LockLauncher — Server Unreachable",
-            "Cannot reach the lock server.\n\nOpen a read-only copy instead?",
+            f"{detail}\n\nOpen a read-only copy instead?",
         ):
             _open_readonly_copy(excel_path)
         sys.exit(0)
@@ -303,7 +377,7 @@ def main() -> None:
             try:
                 acquired = _do_acquire_and_open(server_url, api_key, name, excel_path)
             except Exception as e:
-                messagebox.showerror("LockLauncher", f"Network error:\n{e}")
+                messagebox.showerror("LockLauncher — Could Not Acquire Lock", _describe_error(e, server_url))
                 sys.exit(1)
 
             if acquired:
@@ -314,7 +388,7 @@ def main() -> None:
             try:
                 status = fetch_status(server_url)
             except Exception as e:
-                messagebox.showerror("LockLauncher", f"Network error:\n{e}")
+                messagebox.showerror("LockLauncher — Connection Lost", _describe_error(e, server_url))
                 sys.exit(1)
 
         action = _show_locked_dialog(root, status)
@@ -334,13 +408,13 @@ def main() -> None:
             try:
                 delete_lock(server_url, api_key)
             except Exception as e:
-                messagebox.showerror("LockLauncher", f"Could not release lock:\n{e}")
+                messagebox.showerror("LockLauncher — Could Not Release Lock", _describe_error(e, server_url))
                 sys.exit(1)
 
             try:
                 acquired = _do_acquire_and_open(server_url, api_key, name, excel_path)
             except Exception as e:
-                messagebox.showerror("LockLauncher", f"Network error:\n{e}")
+                messagebox.showerror("LockLauncher — Could Not Acquire Lock", _describe_error(e, server_url))
                 sys.exit(1)
 
             if acquired:
@@ -350,7 +424,7 @@ def main() -> None:
             try:
                 status = fetch_status(server_url)
             except Exception as e:
-                messagebox.showerror("LockLauncher", f"Network error:\n{e}")
+                messagebox.showerror("LockLauncher — Connection Lost", _describe_error(e, server_url))
                 sys.exit(1)
 
 
