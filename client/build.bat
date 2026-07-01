@@ -16,12 +16,17 @@ if errorlevel 1 (
 )
 
 echo.
-echo Building LockLauncher.exe...
+echo Reading exe name from config.ini...
+for /f "usebackq delims=" %%A in (`py -c "import configparser; c=configparser.ConfigParser(); c.read('config.ini'); print(c.get('build','exe_name',fallback='LockLauncher'))"`) do set EXE_NAME=%%A
+echo Exe name: %EXE_NAME%
+
+echo.
+echo Building %EXE_NAME%.exe...
 py -m PyInstaller ^
     --onefile ^
     --windowed ^
     --add-data "config.ini;." ^
-    --name LockLauncher ^
+    --name "%EXE_NAME%" ^
     launcher.py
 
 if errorlevel 1 (
@@ -31,6 +36,6 @@ if errorlevel 1 (
 )
 
 echo.
-echo Build complete: dist\LockLauncher.exe
+echo Build complete: dist\%EXE_NAME%.exe
 echo Copy it into the shared Proton Drive folder alongside the Excel file.
 pause
