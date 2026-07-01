@@ -452,10 +452,20 @@ def main() -> None:
         _run_settings_dialog(load_file_override())
         sys.exit(0)
 
-    cfg = load_config()
-    server_url = cfg["server"]["url"].rstrip("/")
-    api_key = cfg["server"]["api_key"]
-    excel_name = cfg["file"]["name"]
+    try:
+        cfg = load_config()
+        server_url = cfg["server"]["url"].rstrip("/")
+        api_key = cfg["server"]["api_key"]
+        excel_name = cfg["file"]["name"]
+    except (KeyError, configparser.Error) as e:
+        messagebox.showerror(
+            "LockLauncher — Config Error",
+            f"Could not read config.ini (it may be missing or malformed).\n\n"
+            f"Missing key: {e}\n\n"
+            "Rebuild the exe after editing client/config.ini with the correct\n"
+            "server URL, API key, and Excel filename.",
+        )
+        sys.exit(1)
     default_path = _exe_dir() / excel_name
 
     override = load_file_override()
