@@ -283,6 +283,54 @@ def _open_readonly_copy(excel_path: Path) -> None:
     _open(tmp)
 
 
+def _version_mismatch_dialog(filename: str) -> str:
+    """Custom dialog for hash mismatch. Returns 'retry', 'open', or 'cancel'."""
+    dialog = tk.Toplevel()
+    dialog.title("LockLauncher — Wrong Version")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.focus_force()
+
+    dialog.update_idletasks()
+    w, h = 320, 260
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    dialog.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    tk.Label(
+        dialog,
+        text=f"Your copy of {filename}\nmay not be fully synced yet.",
+        font=("Segoe UI", 11, "bold"),
+        pady=12,
+    ).pack()
+
+    tk.Label(
+        dialog,
+        text="Proton Drive is probably still syncing the\n"
+             "other device's changes. Wait a few seconds\n"
+             "then click Retry.",
+        justify="center",
+        pady=4,
+    ).pack()
+
+    choice = tk.StringVar(value="cancel")
+
+    def pick(val: str) -> None:
+        choice.set(val)
+        dialog.destroy()
+
+    frame = tk.Frame(dialog, padx=28, pady=10)
+    frame.pack(fill="x")
+
+    tk.Button(frame, text="Retry", width=24, command=lambda: pick("retry")).pack(pady=3)
+    tk.Button(frame, text="Open Anyway", width=24, command=lambda: pick("open")).pack(pady=3)
+    tk.Button(frame, text="Cancel", width=24, command=lambda: pick("cancel")).pack(pady=3)
+
+    dialog.wait_window()
+    return choice.get()
+
+
 def _check_version_or_warn(excel_path: Path, last_hash: str | None) -> bool:
     """
     Confirms the local file matches the hash recorded the last time the lock
@@ -301,13 +349,12 @@ def _check_version_or_warn(excel_path: Path, last_hash: str | None) -> bool:
         if local_hash == last_hash:
             return True
 
-        if not messagebox.askretrycancel(
-            "LockLauncher — Wrong Version",
-            f"This computer's copy of {excel_path.name} doesn't match the\n"
-            "version that was just saved on the other device.\n\n"
-            "Proton Drive is probably still syncing. Wait a few seconds,\n"
-            "then click Retry — or Cancel to try again later.",
-        ):
+        action = _version_mismatch_dialog(excel_path.name)
+        if action == "retry":
+            continue
+        elif action == "open":
+            return True  # proceeds normally; hash is updated from this file on close
+        else:
             return False
 
 
