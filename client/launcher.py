@@ -407,6 +407,45 @@ def _run_settings_dialog(current_path: Path | None) -> Path | None:
     return new_path
 
 
+def _show_open_choice_dialog(root: tk.Tk, filename: str) -> str:
+    """Shown when the file is unlocked and available. Returns one of: edit / readonly / cancel."""
+    dialog = tk.Toplevel(root)
+    dialog.title("LockLauncher")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.lift()
+    dialog.focus_force()
+
+    dialog.update_idletasks()
+    w, h = 300, 200
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    dialog.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+    tk.Label(
+        dialog,
+        text=f"{filename}\nis available.",
+        font=("Segoe UI", 11, "bold"),
+        pady=16,
+    ).pack()
+
+    choice = tk.StringVar(value="cancel")
+
+    def pick(val: str) -> None:
+        choice.set(val)
+        dialog.destroy()
+
+    frame = tk.Frame(dialog, padx=28, pady=4)
+    frame.pack(fill="x")
+
+    tk.Button(frame, text="Open & Edit (Lock)", width=24, command=lambda: pick("edit")).pack(pady=3)
+    tk.Button(frame, text="Open Read-Only", width=24, command=lambda: pick("readonly")).pack(pady=3)
+    tk.Button(frame, text="Cancel", width=24, command=lambda: pick("cancel")).pack(pady=3)
+
+    dialog.wait_window()
+    return choice.get()
+
+
 def _show_locked_dialog(root: tk.Tk, status: dict) -> str:
     """Shows the locked-file dialog. Returns one of: release / readonly / copy / cancel."""
     locker = status.get("locked_by", "someone")
@@ -557,6 +596,15 @@ def main() -> None:
     # Main loop — handles the (rare) race where we try to acquire a just-locked file
     while True:
         if not status.get("locked"):
+            choice = _show_open_choice_dialog(root, excel_path.name)
+
+            if choice == "cancel":
+                sys.exit(0)
+
+            if choice == "readonly":
+                _open_readonly_copy(excel_path)
+                sys.exit(0)
+
             if not _check_version_or_warn(excel_path, status.get("last_hash")):
                 sys.exit(0)
 
