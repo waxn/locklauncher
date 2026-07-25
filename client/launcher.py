@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -280,6 +281,14 @@ def _open(path: Path) -> None:
 def _open_readonly_copy(excel_path: Path) -> None:
     tmp = Path(tempfile.mkdtemp()) / excel_path.name
     shutil.copy2(excel_path, tmp)
+    # Mark the copy read-only so Excel opens it in genuine read-only mode and
+    # refuses to silently save edits back to this temp file — it forces a
+    # "Save As" instead. Without this, a user can edit, hit save, believe it
+    # saved, then lose everything when the temp copy is discarded on close.
+    try:
+        os.chmod(tmp, stat.S_IREAD)
+    except OSError:
+        pass
     _open(tmp)
 
 
