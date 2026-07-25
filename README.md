@@ -1,269 +1,354 @@
 # LockLauncher
 
-A tiny lock-coordination system for a single Excel file shared by two users over
-Proton Drive. A small VPS holds the lock status (who has the file open, since
-when). A Windows launcher `.exe` sits next to the Excel file — double-click it,
-and it checks the lock, opens the file, and releases the lock automatically
-when you close Excel.
+LockLauncher stops two people from editing the same shared Excel file at the
+same time and overwriting each other's work.
 
-**The Excel file itself never touches the server.** The server only ever
-stores `{locked, locked_by, locked_at, last_hash}` — no file content, no
-file path. `last_hash` is a SHA-256 of the file, recorded when the lock is
-released cleanly, used to catch the case where Proton Drive hasn't finished
-syncing before the next person opens the file (see
-[Version-mismatch detection](#version-mismatch-detection) below).
+Here's the problem it solves: when an Excel file lives in a shared cloud folder
+(Proton Drive), two people can open it at once. Whoever saves last wins, and the
+other person's changes silently vanish. LockLauncher puts a "someone is editing
+this — please wait" sign on the file so that can't happen.
+
+**How people use it:** instead of opening the Excel file directly, everyone
+double-clicks **LockLauncher** (a small program that sits in the same folder).
+LockLauncher checks whether anyone else has the file open. If it's free, it
+opens Excel for you and quietly puts up the "in use" sign. When you close Excel,
+the sign comes down automatically. If someone else already has it open, it tells
+you who, and when they started.
+
+**Your Excel file is never uploaded anywhere.** LockLauncher uses a tiny server
+(a cheap always-on computer in the cloud) to keep track of *who has the file
+open* — nothing more. The server never sees the file or its contents. It only
+remembers a note like `{ in use, by Alice, since 2:14pm }`.
 
 ```
-[User's PC]                         [VPS — Debian]
-  LockLauncher.exe  <-- HTTPS -->     FastAPI lock server
-  ProtonDrive\                          stores only: {locked, "Alice", time}
+Your PC                              The little server (a VPS)
+  LockLauncher  ── internet ──►        keeps one note per file:
+  Proton Drive folder\                   "Budget.xlsx: in use by Alice, 2:14pm"
     Budget.xlsx
-    ~$Budget.xlsx   (Excel's own lock file — used to detect close)
     LockLauncher.exe
 ```
 
 ---
 
-## Repository layout
+## Who this guide is for
 
-```
-locklauncher/
-├── server/
-│   ├── main.py                 FastAPI app — the whole server
-│   ├── requirements.txt
-│   ├── locklauncher.service    systemd unit
-│   └── deploy.sh                git pull + restart, run from your dev machine
-├── client/
-│   ├── launcher.py             the launcher's source
-│   ├── config.ini              server URL / API key / filename — EDIT before building
-│   ├── build.bat                run on Windows to produce LockLauncher.exe
-│   └── requirements.txt
-└── scripts/
-    └── status.sh                quick `curl` status check
-```
+There are really two jobs here:
+
+- **Everyday users** just double-click LockLauncher and open their file. If
+  that's you, skip straight to [Part 3: Using LockLauncher](#part-3-using-locklauncher).
+- **Whoever sets it up** (installs the server, builds the LockLauncher program,
+  and hands it out) needs Parts 1 and 2. You do **not** need to be a programmer,
+  but you will copy and paste some commands. Follow them exactly and it works.
+
+You set the server up **once**. After that you only ever rebuild the
+LockLauncher program when something changes (a new file to manage, a new
+password, etc.).
 
 ---
 
-## 1. Server setup (one-time, on the VPS)
+## What's in this project
 
-Tested on Debian 12 (Bookworm). Run as root.
+```
+locklauncher/
+├── server/                     Runs on the always-on cloud computer
+│   ├── main.py                   the whole server program
+│   ├── requirements.txt          list of things the server needs installed
+│   ├── locklauncher.service      tells the server to keep running 24/7
+│   └── deploy.sh                 pushes updates to the server
+├── client/                     Runs on each person's Windows PC
+│   ├── launcher.py               the LockLauncher program's source
+│   ├── config.ini              ◄ THE SETTINGS FILE YOU EDIT (server address,
+│   │                             password, which file, etc.)
+│   ├── build.bat                 double-click on Windows to build the program
+│   └── requirements.txt
+└── scripts/
+    └── status.sh                 quick "is anyone using the file?" check
+```
+
+The one file you'll touch most is **`client/config.ini`**. That's where all the
+settings live.
+
+---
+
+## Part 1: Set up the server (once)
+
+The server is a small always-on computer you rent in the cloud (a "VPS").
+These steps were tested on **Debian 12**. You do this **one time**.
+
+You'll be typing commands into the server over SSH. If you've never done that,
+your VPS provider (e.g. Hetzner, DigitalOcean) has a "how to connect via SSH"
+guide — follow it to get a black terminal window logged into your server, then
+come back here.
+
+Copy and paste these blocks one at a time. Replace `<your-repo-url>` with the
+web address where this project lives (ask whoever gave you this).
 
 ```bash
+# Install the basic tools the server needs
 apt update && apt install -y python3-venv ufw git
 
-# Clone the repo onto the server (adjust the URL to wherever you host it)
+# Download this project onto the server
 git clone <your-repo-url> ~/locklauncher
 cd ~/locklauncher
 
-# Firewall — only SSH and the lock server's port
+# Lock down the firewall — allow only SSH and LockLauncher's port
 ufw allow 22
 ufw allow 47291
 ufw enable
 
-# Python environment
+# Set up the server's private workspace
 python3 -m venv ~/locklauncher/venv
 ~/locklauncher/venv/bin/pip install -r server/requirements.txt
 
-# Generate the API key once and save it server-side only
+# Create a secret password (the "API key") that only your PCs will know
 echo "API_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(24))')" > ~/locklauncher/.env
 chmod 600 ~/locklauncher/.env
 
-# Install as a systemd service
+# Turn LockLauncher's server on, and make it restart itself forever
 cp server/locklauncher.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now locklauncher
 ```
 
-Verify it's up:
+**Check it's working:**
 
 ```bash
 curl http://localhost:47291/health
-# {"status":"ok"}
 ```
 
-Grab the API key you'll need for the client config:
+You should see `{"status":"ok"}`. 🎉
+
+**Get the secret password** you just generated — you'll need it in Part 2:
 
 ```bash
 cat ~/locklauncher/.env
 ```
 
-### Port
+Copy the long string after `API_KEY=` and keep it handy.
 
-The server listens on **47291** (an arbitrary, non-default port, chosen to
-avoid casual bot scanning — there's no real secrecy here, the API key is the
-actual gate). To change it, edit the `--port` flag in
-`server/locklauncher.service` and the `url` in `client/config.ini`, then
-re-deploy.
+> **The port number (47291)** is just an uncommon number picked so random
+> internet bots don't stumble onto it. The real security is the secret
+> password. If you ever want to change the port, edit it in both
+> `server/locklauncher.service` and `client/config.ini`.
 
-### Redeploying after server code changes
+### Later: updating the server
 
-From your dev machine, edit `server/deploy.sh` to set `VPS_HOST`, then:
+If the server program (`server/main.py`) ever changes, push the new version
+from your own computer:
 
 ```bash
 ./server/deploy.sh
 ```
 
-This SSHes in, does `git pull`, reinstalls dependencies, and restarts the
-service. (Push your changes to the repo first — the server pulls from git,
-it doesn't receive files directly.)
-
-### Checking status from your own machine
-
-```bash
-./scripts/status.sh http://<vps-ip>:47291
-```
-
-Or directly:
-
-```bash
-curl -s http://<vps-ip>:47291/status | python3 -m json.tool
-```
-
-### API reference
-
-| Method | Path      | Auth        | Body                          | Description          |
-|--------|-----------|-------------|---------------------------------|-----------------------|
-| GET    | `/health` | none        | —                               | Liveness check        |
-| GET    | `/status` | none        | —                               | `{locked, locked_by, locked_at, last_hash}` |
-| POST   | `/lock`   | `X-API-Key` | `{"name": "Alice"}`            | Acquire lock (409 if already locked) |
-| DELETE | `/lock`   | `X-API-Key` | `{"hash": "..."}` (optional)   | Release lock; hash is recorded as `last_hash` if provided |
+(Open `server/deploy.sh` first and set `VPS_HOST` to your server's address.
+Also make sure your changes are pushed to the shared repo first — the server
+downloads them from there.)
 
 ---
 
-## 2. Building the client `.exe` (on Windows)
+## Part 2: Build the LockLauncher program (on Windows)
 
-The launcher is Python, bundled into a single `LockLauncher.exe` via
-PyInstaller. You need a Windows machine with Python installed
-(python.org installer, which provides the `py` launcher).
+LockLauncher is handed out as a single Windows file, `LockLauncher.exe`. You
+build it on a **Windows PC that has Python installed** (get Python from
+[python.org](https://www.python.org/downloads/) — during install, tick "Add
+Python to PATH").
 
-1. Copy the `client/` folder to the Windows machine.
-2. Edit `client/config.ini`:
-   ```ini
-   [server]
-   url = http://<vps-ip>:47291
-   api_key = <the API_KEY value from the server's .env>
+### Step 1 — Copy the `client` folder to the Windows PC
 
-   [file]
-   name = Budget.xlsx
-   ```
-   `name` must exactly match the Excel file's filename (with extension).
-3. Run `build.bat` (double-click it, or run from a terminal). It will:
-   - `py -m pip install -r requirements.txt`
-   - `py -m PyInstaller --onefile --windowed --add-data "config.ini;." --name LockLauncher launcher.py`
-4. Output: `dist\LockLauncher.exe` — a single file. `config.ini` is baked
-   inside it; nothing else needs to ship alongside it.
-5. Copy `LockLauncher.exe` into the same Proton Drive folder as the Excel
-   file.
+Just the `client` folder is enough.
 
-If `build.bat` fails with `'pip' is not recognized` or
-`'pyinstaller' is not recognized` — make sure you're using the current
-version of `build.bat`, which invokes everything through `py -m ...` rather
-than bare commands (some Python installs don't add the `Scripts` folder to
-PATH, but the `py` launcher itself is always on PATH).
+### Step 2 — Edit the settings file `config.ini`
 
-### Rebuilding after a config or server change
+Open `client/config.ini` in Notepad. It looks like this:
 
-Whenever the VPS IP, API key, or Excel filename changes, edit
-`client/config.ini` and re-run `build.bat`, then redistribute the new
-`LockLauncher.exe`.
+```ini
+[server]
+url = http://<your-server-ip>:47291
+api_key = <the secret password from Part 1>
+
+[file]
+name = Budget.xlsx
+id = budget
+
+[build]
+exe_name = LockLauncher
+```
+
+Fill in each line:
+
+- **`url`** — your server's address, e.g. `http://203.0.113.5:47291`.
+- **`api_key`** — the long secret password you copied at the end of Part 1.
+- **`name`** — the exact Excel filename, including `.xlsx`, e.g. `Budget.xlsx`.
+- **`id`** — a short nickname for *this* file. See the important note below.
+- **`exe_name`** — what the built program should be called. For a file called
+  Budget you might use `Budget Launcher`, so people know which button opens which
+  file.
+
+> ### ⚠️ Important if you're managing more than one file
+>
+> Every file you manage needs its **own unique `id`** — a short nickname like
+> `budget`, `sales`, `inventory`. The `id` is what the server uses to tell the
+> files apart. If two files share the same `id`, LockLauncher will think they're
+> the same file and one person opening Budget will block someone else from
+> opening Sales.
+>
+> Good news: **all your files can share the same server and the same
+> `api_key`.** You only change `name`, `id`, and `exe_name` for each new file.
+>
+> If you leave `id` blank, LockLauncher just uses the filename as the id — fine
+> when you only have one file, but set a real `id` as soon as you have two.
+
+### Step 3 — Build it
+
+Double-click **`build.bat`**. A black window opens and does the work. When it
+finishes you'll see:
+
+```
+Build complete: dist\LockLauncher.exe
+```
+
+Your finished program is in the newly-created **`dist`** folder. All the
+settings are baked inside it — you don't need to ship `config.ini` alongside it.
+
+### Step 4 — Hand it out
+
+Copy the finished `.exe` from `dist\` into the **same Proton Drive folder as the
+Excel file**, so it sits right next to it. Everyone who shares that folder now
+has LockLauncher.
+
+### If the build fails
+
+- **"pip is not recognized"** or **"pyinstaller is not recognized"** — Python
+  wasn't added to PATH during install. Reinstall Python and tick "Add Python to
+  PATH", or use the current `build.bat` (it already works around this).
+- Anything else — the black window stays open with the error. Read the last few
+  lines; it usually names the missing piece.
+
+### Rebuilding later
+
+Any time the server address, the password, or a filename changes: edit
+`config.ini`, double-click `build.bat` again, and give people the new `.exe`.
 
 ---
 
-## 3. Using LockLauncher (end users)
+## Part 3: Using LockLauncher
 
-1. Double-click `LockLauncher.exe`.
-2. **First run only:** you'll be asked for your name. It's saved locally to
-   `%LOCALAPPDATA%\LockLauncher\user.json` and used to label the lock and to
-   show others who's editing.
-3. If the file is **not locked**: the lock is acquired, Excel opens the file,
-   and LockLauncher waits quietly in the background. When you close Excel,
-   the lock is released automatically — no extra action needed.
-4. If the file **is locked**, you'll see who has it and for how long, with
-   four options:
-   - **Release Lock & Open** (shown in red — this overrides someone else's
-     active session) — force-clears a stale lock (e.g. the other user's app
-     crashed) and opens the file for editing.
-   - **Open Read-Only** — opens a temporary copy for viewing only.
-   - **Edit a Copy** — saves a timestamped copy to your Desktop and opens
-     it. Changes here do **not** sync back to the shared file automatically.
-   - **Cancel** — does nothing.
+*(This is the part to share with everyday users.)*
 
-### How lock release actually works
+**Open your shared file by double-clicking LockLauncher instead of the Excel
+file itself.** That's the only habit to build.
 
-LockLauncher watches for Excel's own hidden lock file
-(`~$<filename>.xlsx`), which Excel creates locally the moment it opens a
-file and deletes the moment it closes it. This file lives in the same
-(possibly cloud-synced) folder, but LockLauncher only ever reads it on the
-local machine — it never depends on that file syncing across Proton Drive.
-When it disappears, LockLauncher tells the server to release the lock.
+1. **Double-click LockLauncher.**
+2. **First time only:** it asks for your name. This is just so coworkers can see
+   who's got the file open. It's saved on your PC and you won't be asked again.
+3. **If the file is free**, you get two choices:
+   - **Open & Edit (Lock)** — opens the file in Excel for you and marks it "in
+     use" for everyone else. When you close Excel, it's automatically freed. You
+     don't have to do anything to release it.
+   - **Open Read-Only** — opens a look-only copy without locking anything. Great
+     for a quick peek when you don't need to change anything.
+4. **If someone else has it open**, LockLauncher tells you **who** and **how
+   long ago** they started, and offers:
+   - **Release Lock & Open** *(red button)* — forces the file free and opens it
+     for *you*. Only use this if you're sure the other person is actually done
+     (for example their computer crashed and left the file stuck). Using it while
+     they're really editing can cause a clash.
+   - **Open Read-Only** — view a copy without disturbing them.
+   - **Edit a Copy** — makes a dated copy on your Desktop and opens that. Your
+     changes go into *your copy only* — they do **not** flow back into the shared
+     file automatically.
+   - **Cancel** — closes without doing anything.
 
-### Version-mismatch detection
+### "Waiting to finish syncing…"
 
-The lock alone doesn't guarantee Proton Drive has actually finished
-syncing the other person's edits to your machine before you open the
-file — sync can lag well behind the lock being released. To catch this:
+Sometimes after someone else finishes, Proton Drive hasn't finished copying
+their latest changes down to your PC yet. If LockLauncher notices your copy is
+still catching up, it shows a **"Syncing"** window and **waits** — it opens the
+file **automatically** the moment your copy is up to date. You can just leave it;
+there's nothing to click. (There's an **Open Anyway** button if you're in a
+hurry and understand you might not have the very latest version, and **Cancel**
+to back out.)
 
-- When LockLauncher detects Excel has closed the file, it hashes the
-  (now-saved) file and sends that hash to the server along with the
-  release.
-- The next time anyone tries to open the file, LockLauncher hashes its own
-  **local** copy first and compares it to the server's recorded hash.
-- If they don't match, your local copy hasn't synced yet. You'll see a
-  **"Wrong Version"** dialog telling you to wait for Proton Drive to catch
-  up, with **Retry** and **Cancel** buttons — no lock is taken and the file
-  is not opened until the hashes agree.
+This safety check only runs when you're opening a file to *edit* it. Read-Only
+and Edit-a-Copy skip it, because those already mean "I know this might not be the
+newest version."
 
-This check runs whenever LockLauncher is about to open the file for
-editing, including after using **Release Lock & Open**. It does not apply
-to **Open Read-Only** or **Edit a Copy**, since those are already explicit
-"I know this might not be current" actions.
+### Pointing LockLauncher at a moved or renamed file
 
-### Changing which file LockLauncher manages
-
-By default LockLauncher manages the file named in `config.ini`, in the
-same folder as the exe. To point it at a different file (e.g. it moved, or
-got renamed) without rebuilding:
+If the Excel file gets moved or renamed and LockLauncher can't find it, it will
+offer to let you locate it. You can also do this any time by running
+LockLauncher with a `--settings` switch:
 
 ```
 LockLauncher.exe --settings
 ```
 
-This opens a file picker; the choice is saved to
-`%LOCALAPPDATA%\LockLauncher\settings.json` and overrides `config.ini` from
-then on for that device. (Make a desktop shortcut to `LockLauncher.exe`
-with `--settings` appended to the Target field for quick access.) If
-LockLauncher can't find the configured file at startup, it will offer to
-open this picker automatically.
+That pops up a file picker; your choice is remembered on your PC. (Tip: make a
+desktop shortcut to LockLauncher, and add ` --settings` to the end of the
+Target field for a one-click way to do this.)
 
 ---
 
 ## Troubleshooting
 
-**"Cannot find: ...\Budget.xlsx"** — the Excel file isn't in the same folder
-as `LockLauncher.exe`, or Proton Drive isn't mounted/synced yet.
+**"Cannot find: …\Budget.xlsx"** — LockLauncher isn't in the same folder as the
+Excel file, or Proton Drive hasn't finished loading. Make sure Proton Drive is
+running and the folder shows as synced.
 
-**"Timed out trying to reach ..."** — the server may be down, or a firewall
-is blocking port 47291. On the server: `systemctl status locklauncher` and
+**"Timed out trying to reach …"** — the server may be off, or a firewall is
+blocking it. On the server, check `systemctl status locklauncher` and
 `ufw status`.
 
-**"Connection refused by ..."** — the service isn't running. On the server:
-`systemctl status locklauncher`, then `systemctl restart locklauncher` if
-needed.
+**"Connection refused by …"** — the server program isn't running. On the server:
+`systemctl status locklauncher`, then `systemctl restart locklauncher`.
 
-**"Could not resolve the server address ..."** — the IP/hostname in
-`config.ini` is wrong, or this machine has no internet access.
+**"Could not resolve the server address …"** — the address in `config.ini` is
+wrong, or the PC has no internet.
 
-**"The server rejected the API key"** (HTTP 401) — `api_key` in
-`config.ini` doesn't match `API_KEY` in the server's `.env`. Re-check
-`cat ~/locklauncher/.env` on the server, fix `config.ini`, and rebuild.
+**"The server rejected the API key" (401)** — the password in `config.ini`
+doesn't match the one on the server. Re-check with `cat ~/locklauncher/.env` on
+the server, fix `config.ini`, and rebuild the `.exe`.
 
-**Lock appears stuck even though no one has the file open** — this can
-happen if the app was killed before the watcher thread could release the
-lock (e.g. a forced shutdown). Use **Release Lock & Open** from the locked
-dialog to clear it.
+**The file shows as locked but nobody has it open** — this can happen if
+someone's computer crashed or was shut off before LockLauncher could free the
+file. Use **Release Lock & Open** to clear it.
 
-**"Wrong Version" dialog won't go away even after waiting** — Proton Drive
-sync may be stalled. Check the Proton Drive client is running and signed
-in, and that the folder shows as synced (not "syncing...") on both
-machines. As a last resort, manually verify the file's modified time looks
-recent before clicking Retry again.
+**Opening Budget also locks Sales (or vice-versa)** — the two files have the
+same `id` in their `config.ini`. Give each file a unique `id`, rebuild both, and
+hand out the new versions. See the note in [Part 2, Step 2](#step-2--edit-the-settings-file-configini).
+
+**The "Syncing" window never opens the file** — Proton Drive may be stuck. Make
+sure the Proton Drive app is running and signed in on both PCs and the folder
+shows as fully synced (not "syncing…").
+
+---
+
+## For the technically curious
+
+The server is a small FastAPI app. It stores one note per file, keyed by the
+`id` from `config.ini`, in a single `lock_state.json` file. No Excel content or
+file paths are ever sent to it.
+
+| Method | Path      | Auth        | Body / query                          | Purpose |
+|--------|-----------|-------------|----------------------------------------|---------|
+| GET    | `/health` | none        | —                                      | Liveness check |
+| GET    | `/status` | none        | `?lock_id=budget`                      | Who holds this file's lock |
+| POST   | `/lock`   | `X-API-Key` | `{"name": "Alice", "lock_id": "budget"}` | Take the lock (409 if already held) |
+| DELETE | `/lock`   | `X-API-Key` | `{"lock_id": "budget", "hash": "…"}`   | Release; `hash` is remembered as `last_hash` |
+
+`lock_id` defaults to `default` if a client doesn't send one, so older builds
+keep working. The `last_hash` is a SHA-256 fingerprint of the file recorded on a
+clean close; the next opener compares their local copy against it to detect a
+lagging Proton Drive sync (that's what powers the "Syncing" window).
+
+**How releasing works under the hood:** Excel creates a hidden lock file named
+`~$<filename>` while a file is open and deletes it on close. LockLauncher
+watches for that file to disappear (reading it purely locally — it never relies
+on that file syncing to the cloud) and then tells the server to release the
+lock.
+
+Check status from your own machine any time:
+
+```bash
+./scripts/status.sh http://<vps-ip>:47291
+```

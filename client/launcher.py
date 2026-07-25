@@ -167,17 +167,17 @@ def _describe_error(e: Exception, server_url: str) -> str:
 # Server calls
 # ---------------------------------------------------------------------------
 
-def fetch_status(server_url: str) -> dict:
-    resp = requests.get(f"{server_url}/status", timeout=5)
+def fetch_status(server_url: str, lock_id: str) -> dict:
+    resp = requests.get(f"{server_url}/status", params={"lock_id": lock_id}, timeout=5)
     resp.raise_for_status()
     return resp.json()
 
 
-def post_lock(server_url: str, api_key: str, name: str) -> bool:
+def post_lock(server_url: str, api_key: str, name: str, lock_id: str) -> bool:
     """Returns True if lock acquired, False if already locked (409)."""
     resp = requests.post(
         f"{server_url}/lock",
-        json={"name": name},
+        json={"name": name, "lock_id": lock_id},
         headers={"X-API-Key": api_key},
         timeout=5,
     )
@@ -187,11 +187,11 @@ def post_lock(server_url: str, api_key: str, name: str) -> bool:
     return True
 
 
-def delete_lock(server_url: str, api_key: str, file_hash: str | None = None) -> None:
+def delete_lock(server_url: str, api_key: str, lock_id: str, file_hash: str | None = None) -> None:
     requests.delete(
         f"{server_url}/lock",
         headers={"X-API-Key": api_key},
-        json={"hash": file_hash},
+        json={"hash": file_hash, "lock_id": lock_id},
         timeout=5,
     ).raise_for_status()
 
@@ -222,7 +222,7 @@ def _hash_file_with_retry(path: Path, attempts: int = 5, delay: float = 1.0) -> 
 # File monitoring
 # ---------------------------------------------------------------------------
 
-def _watch_and_release(excel_path: Path, server_url: str, api_key: str) -> None:
+def _watch_and_release(excel_path: Path, server_url: str, api_key: str, lock_id: str) -> None:
     """
     Background thread: waits for Excel to open the file, then waits for it to
     close, then releases the server lock. Polls for Excel's hidden lock file.
@@ -247,7 +247,7 @@ def _watch_and_release(excel_path: Path, server_url: str, api_key: str) -> None:
     # Release the server lock, retrying on transient network failures
     while True:
         try:
-            delete_lock(server_url, api_key, file_hash=file_hash)
+            delete_lock(server_url, api_key, lock_id, file_hash=file_hash)
             return
         except Exception:
             time.sleep(10)
@@ -283,38 +283,46 @@ def _open_readonly_copy(excel_path: Path) -> None:
     _open(tmp)
 
 
-def _version_mismatch_dialog(filename: str) -> str:
-    """Custom dialog for hash mismatch. Returns 'retry', 'open', or 'cancel'."""
+def _wait_for_sync_dialog(excel_path: Path, last_hash: str) -> str:
+    """
+    Auto-polling dialog shown when the local file doesn't yet match the hash
+    recorded on the last clean release. Re-hashes the file every couple of
+    seconds and resolves on its own once it matches. Returns:
+      'ok'     — hashes now match; safe to proceed
+      'open'   — user chose to open the not-yet-synced copy anyway
+      'cancel' — user gave up waiting
+    """
     dialog = tk.Toplevel()
-    dialog.title("LockLauncher — Wrong Version")
+    dialog.title("LockLauncher — Syncing")
     dialog.resizable(False, False)
     dialog.grab_set()
     dialog.lift()
     dialog.focus_force()
 
     dialog.update_idletasks()
-    w, h = 320, 260
+    w, h = 340, 250
     sw = dialog.winfo_screenwidth()
     sh = dialog.winfo_screenheight()
     dialog.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
 
     tk.Label(
         dialog,
-        text=f"Your copy of {filename}\nmay not be fully synced yet.",
+        text=f"Waiting for {excel_path.name}\nto finish syncing…",
         font=("Segoe UI", 11, "bold"),
         pady=12,
     ).pack()
 
-    tk.Label(
+    status = tk.Label(
         dialog,
-        text="Proton Drive is probably still syncing the\n"
-             "other device's changes. Wait a few seconds\n"
-             "then click Retry.",
+        text="Your copy is still catching up with the\n"
+             "other device's changes. This will open\n"
+             "automatically once it's synced.",
         justify="center",
         pady=4,
-    ).pack()
+    )
+    status.pack()
 
-    choice = tk.StringVar(value="cancel")
+    choice = tk.StringVar(value="")
 
     def pick(val: str) -> None:
         choice.set(val)
@@ -323,39 +331,53 @@ def _version_mismatch_dialog(filename: str) -> str:
     frame = tk.Frame(dialog, padx=28, pady=10)
     frame.pack(fill="x")
 
-    tk.Button(frame, text="Retry", width=24, command=lambda: pick("retry")).pack(pady=3)
     tk.Button(frame, text="Open Anyway", width=24, command=lambda: pick("open")).pack(pady=3)
     tk.Button(frame, text="Cancel", width=24, command=lambda: pick("cancel")).pack(pady=3)
 
-    dialog.wait_window()
-    return choice.get()
+    start = time.monotonic()
 
-
-def _check_version_or_warn(excel_path: Path, last_hash: str | None) -> bool:
-    """
-    Confirms the local file matches the hash recorded the last time the lock
-    was released cleanly. Returns True if it's safe to proceed, False if the
-    user gave up waiting for Proton Drive to sync.
-    """
-    if not last_hash:
-        return True
-
-    while True:
+    def poll() -> None:
+        if choice.get():  # a button already resolved the dialog
+            return
         try:
             local_hash = _hash_file(excel_path)
         except OSError:
             local_hash = None
 
         if local_hash == last_hash:
-            return True
+            pick("ok")
+            return
 
-        action = _version_mismatch_dialog(excel_path.name)
-        if action == "retry":
-            continue
-        elif action == "open":
-            return True  # proceeds normally; hash is updated from this file on close
-        else:
-            return False
+        waited = int(time.monotonic() - start)
+        status.config(
+            text="Your copy is still catching up with the\n"
+                 "other device's changes. This will open\n"
+                 f"automatically once it's synced.\n\n(waited {waited}s)"
+        )
+        dialog.after(2000, poll)
+
+    dialog.after(500, poll)
+    dialog.wait_window()
+    return choice.get() or "cancel"
+
+
+def _check_version_or_warn(excel_path: Path, last_hash: str | None) -> bool:
+    """
+    Confirms the local file matches the hash recorded the last time the lock
+    was released cleanly. Returns True if it's safe to proceed, False if the
+    user gave up waiting for the cloud folder to sync.
+    """
+    if not last_hash:
+        return True
+
+    # Fast path: already in sync, so don't pop a dialog at all.
+    try:
+        if _hash_file(excel_path) == last_hash:
+            return True
+    except OSError:
+        pass
+
+    return _wait_for_sync_dialog(excel_path, last_hash) in ("ok", "open")
 
 
 def _open_edit_copy(excel_path: Path) -> None:
@@ -502,20 +524,20 @@ def _show_locked_dialog(root: tk.Tk, status: dict) -> str:
 # Core acquire-and-open flow
 # ---------------------------------------------------------------------------
 
-def _do_acquire_and_open(server_url: str, api_key: str, name: str, excel_path: Path) -> bool:
+def _do_acquire_and_open(server_url: str, api_key: str, name: str, excel_path: Path, lock_id: str) -> bool:
     """
     Acquires the server lock, opens the file, starts the file watcher, and
     blocks until the file is closed (watcher releases the lock). Returns False
     if the lock was already taken (409).
     """
-    if not post_lock(server_url, api_key, name):
+    if not post_lock(server_url, api_key, name, lock_id):
         return False
 
     _open(excel_path)
 
     t = threading.Thread(
         target=_watch_and_release,
-        args=(excel_path, server_url, api_key),
+        args=(excel_path, server_url, api_key, lock_id),
         daemon=True,
     )
     t.start()
@@ -543,6 +565,11 @@ def main() -> None:
         server_url = cfg["server"]["url"].rstrip("/")
         api_key = cfg["server"]["api_key"]
         excel_name = cfg["file"]["name"]
+        # Lock id keys the lock on the server, so multiple files can share one
+        # server / API key without clobbering each other's lock. Set a stable
+        # `id` under [file] in config.ini for each file; if omitted we fall
+        # back to the filename.
+        lock_id = cfg.get("file", "id", fallback="").strip() or excel_name
     except (KeyError, configparser.Error) as e:
         messagebox.showerror(
             "LockLauncher — Config Error",
@@ -583,7 +610,7 @@ def main() -> None:
 
     # Fetch current lock status
     try:
-        status = fetch_status(server_url)
+        status = fetch_status(server_url, lock_id)
     except Exception as e:
         detail = _describe_error(e, server_url)
         if messagebox.askyesno(
@@ -609,7 +636,7 @@ def main() -> None:
                 sys.exit(0)
 
             try:
-                acquired = _do_acquire_and_open(server_url, api_key, name, excel_path)
+                acquired = _do_acquire_and_open(server_url, api_key, name, excel_path, lock_id)
             except Exception as e:
                 messagebox.showerror("LockLauncher — Could Not Acquire Lock", _describe_error(e, server_url))
                 sys.exit(1)
@@ -620,7 +647,7 @@ def main() -> None:
             # Race condition: someone grabbed the lock between our status check
             # and our POST — re-fetch and fall through to the locked dialog
             try:
-                status = fetch_status(server_url)
+                status = fetch_status(server_url, lock_id)
             except Exception as e:
                 messagebox.showerror("LockLauncher — Connection Lost", _describe_error(e, server_url))
                 sys.exit(1)
@@ -640,8 +667,8 @@ def main() -> None:
 
         elif action == "release":
             try:
-                delete_lock(server_url, api_key)
-                status = fetch_status(server_url)
+                delete_lock(server_url, api_key, lock_id)
+                status = fetch_status(server_url, lock_id)
             except Exception as e:
                 messagebox.showerror("LockLauncher — Could Not Release Lock", _describe_error(e, server_url))
                 sys.exit(1)
@@ -650,7 +677,7 @@ def main() -> None:
                 sys.exit(0)
 
             try:
-                acquired = _do_acquire_and_open(server_url, api_key, name, excel_path)
+                acquired = _do_acquire_and_open(server_url, api_key, name, excel_path, lock_id)
             except Exception as e:
                 messagebox.showerror("LockLauncher — Could Not Acquire Lock", _describe_error(e, server_url))
                 sys.exit(1)
@@ -660,7 +687,7 @@ def main() -> None:
 
             # Someone else grabbed it in the brief window — loop back to locked dialog
             try:
-                status = fetch_status(server_url)
+                status = fetch_status(server_url, lock_id)
             except Exception as e:
                 messagebox.showerror("LockLauncher — Connection Lost", _describe_error(e, server_url))
                 sys.exit(1)
