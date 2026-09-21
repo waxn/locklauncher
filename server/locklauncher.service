@@ -4,6 +4,13 @@ After=network.target
 
 [Service]
 WorkingDirectory=/root/locklauncher/server
+# Minutes of silence before a lock is considered abandoned. The client renews
+# its lease every 60 s while the file is open, so this is 5 missed heartbeats.
+Environment=LOCK_STALE_MINUTES=5
+# Fallback for locks taken by clients too old to send heartbeats; unused once
+# both machines are updated. Override either in .env, which is read after
+# these lines and therefore wins.
+Environment=LOCK_TTL_HOURS=8
 EnvironmentFile=/root/locklauncher/.env
 ExecStart=/root/locklauncher/venv/bin/uvicorn main:app --host 0.0.0.0 --port 47291
 Restart=always

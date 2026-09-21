@@ -9,6 +9,8 @@
 #   venv/bin/pip install -r server/requirements.txt
 #   echo "API_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(24))')" > ~/locklauncher/.env
 #   chmod 600 ~/locklauncher/.env
+#   # Optional: override how long a lock survives without a heartbeat
+#   # echo "LOCK_STALE_MINUTES=5" >> ~/locklauncher/.env
 #   cp server/locklauncher.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now locklauncher
 #

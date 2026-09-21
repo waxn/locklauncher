@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,11 +175,11 @@ def fetch_status(server_url: str, lock_id: str) -> dict:
     return resp.json()
 
 
-def post_lock(server_url: str, api_key: str, name: str, lock_id: str) -> bool:
+def post_lock(server_url: str, api_key: str, name: str, lock_id: str, token: str) -> bool:
     """Returns True if lock acquired, False if already locked (409)."""
     resp = requests.post(
         f"{server_url}/lock",
-        json={"name": name, "lock_id": lock_id},
+        json={"name": name, "lock_id": lock_id, "token": token},
         headers={"X-API-Key": api_key},
         timeout=5,
     )
@@ -188,13 +189,47 @@ def post_lock(server_url: str, api_key: str, name: str, lock_id: str) -> bool:
     return True
 
 
-def delete_lock(server_url: str, api_key: str, lock_id: str, file_hash: str | None = None) -> None:
-    requests.delete(
+def post_heartbeat(server_url: str, api_key: str, lock_id: str, token: str) -> bool:
+    """
+    Renews our lease on the lock. Returns False if the server says the lock is
+    no longer ours (409), which means the lease lapsed and someone else has
+    taken the file. Network failures raise, so the caller can keep retrying.
+    """
+    resp = requests.post(
+        f"{server_url}/heartbeat",
+        json={"lock_id": lock_id, "token": token},
+        headers={"X-API-Key": api_key},
+        timeout=5,
+    )
+    if resp.status_code == 409:
+        return False
+    resp.raise_for_status()
+    return True
+
+
+def delete_lock(
+    server_url: str,
+    api_key: str,
+    lock_id: str,
+    file_hash: str | None = None,
+    token: str | None = None,
+) -> bool:
+    """
+    Releases the lock. Pass `token` to release the lock this process took --
+    the server then refuses (409, returned here as False) if the lease has
+    since passed to someone else. Omit it for the deliberate "Release Lock &
+    Open" override, which clears whatever is there.
+    """
+    resp = requests.delete(
         f"{server_url}/lock",
         headers={"X-API-Key": api_key},
-        json={"hash": file_hash, "lock_id": lock_id},
+        json={"hash": file_hash, "lock_id": lock_id, "token": token},
         timeout=5,
-    ).raise_for_status()
+    )
+    if resp.status_code == 409:
+        return False
+    resp.raise_for_status()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -223,35 +258,150 @@ def _hash_file_with_retry(path: Path, attempts: int = 5, delay: float = 1.0) -> 
 # File monitoring
 # ---------------------------------------------------------------------------
 
-def _watch_and_release(excel_path: Path, server_url: str, api_key: str, lock_id: str) -> None:
+# How often we renew the lease while the file is open. The server frees the
+# lock a few minutes after these stop arriving, so it must divide comfortably
+# into the server's LOCK_STALE_MINUTES.
+HEARTBEAT_SECONDS = 60
+
+# Excel keeps its ~$ owner file open for as long as the workbook is open, so a
+# file we can open for writing is one no Excel is holding -- an orphan left by
+# a crash or resurrected by a cloud sync. We require the condition to hold this
+# long before acting on it, so a momentary gap can't end a live session.
+ORPHAN_CONFIRM_SECONDS = 30
+
+
+def _owner_file(excel_path: Path) -> Path:
+    """Excel's hidden owner file for this workbook."""
+    return excel_path.parent / f"~${excel_path.name}"
+
+
+def _owner_file_orphaned(lock_file: Path) -> bool:
+    """
+    True if the owner file exists but no Excel is holding it open.
+
+    Excel opens the owner file with write sharing denied, so being able to
+    open it r+b ourselves means the Excel that made it is gone. A leftover
+    like this is what used to wedge this watcher forever: the file never
+    disappears, so the lock was never released.
+    """
+    try:
+        with open(lock_file, "r+b"):
+            return True
+    except OSError:
+        # PermissionError => a live Excel holds it. Anything else (including
+        # the file vanishing underneath us) is handled by the caller's
+        # exists() check on the next pass.
+        return False
+
+
+def clear_orphan_owner_file(excel_path: Path) -> bool:
+    """
+    Best-effort removal of a stale ~$ file before we open the workbook.
+
+    Left in place it does double damage: Excel sees it and offers only
+    read-only, and our watcher waits forever for it to disappear. Deleting it
+    can only succeed when nothing holds it open, so a live session is never
+    at risk.
+    """
+    lock_file = _owner_file(excel_path)
+    if not lock_file.exists() or not _owner_file_orphaned(lock_file):
+        return False
+    try:
+        lock_file.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _heartbeat_loop(
+    server_url: str,
+    api_key: str,
+    lock_id: str,
+    token: str,
+    stop: threading.Event,
+    lost: threading.Event,
+) -> None:
+    """
+    Renews the lease every HEARTBEAT_SECONDS until the watcher signals `stop`.
+
+    Network errors are ignored and retried on the next tick -- the server's
+    stale window is several heartbeats wide precisely so a brief drop doesn't
+    cost the lock. A 409 is different: it means the lock is genuinely no
+    longer ours, so we set `lost` and stop.
+    """
+    while not stop.wait(HEARTBEAT_SECONDS):
+        try:
+            if not post_heartbeat(server_url, api_key, lock_id, token):
+                lost.set()
+                return
+        except Exception:
+            continue
+
+
+def _watch_and_release(
+    excel_path: Path,
+    server_url: str,
+    api_key: str,
+    lock_id: str,
+    token: str,
+    stop: threading.Event,
+    lost: threading.Event,
+) -> None:
     """
     Background thread: waits for Excel to open the file, then waits for it to
     close, then releases the server lock. Polls for Excel's hidden lock file.
     """
-    lock_file = excel_path.parent / f"~${excel_path.name}"
+    lock_file = _owner_file(excel_path)
+    try:
+        # Give Excel up to 60 s to create the lock file after os.startfile
+        for _ in range(120):
+            if lock_file.exists():
+                break
+            time.sleep(0.5)
 
-    # Give Excel up to 60 s to create the lock file after os.startfile
-    for _ in range(120):
-        if lock_file.exists():
-            break
-        time.sleep(0.5)
+        # Wait until Excel closes the file. An owner file that nobody holds
+        # open is a leftover rather than a live session, so don't wait on it
+        # forever -- that is exactly how a lock used to get stuck.
+        orphan_since = None
+        while lock_file.exists():
+            if _owner_file_orphaned(lock_file):
+                if orphan_since is None:
+                    orphan_since = time.monotonic()
+                elif time.monotonic() - orphan_since >= ORPHAN_CONFIRM_SECONDS:
+                    clear_orphan_owner_file(excel_path)
+                    break
+            else:
+                orphan_since = None
+            time.sleep(0.5)
 
-    # Wait until Excel closes the file
-    while lock_file.exists():
-        time.sleep(0.5)
+        # Let the filesystem settle, then hash the final saved file so the next
+        # opener can detect whether their local Proton Drive copy has synced.
+        time.sleep(1)
+        file_hash = _hash_file_with_retry(excel_path)
 
-    # Let the filesystem settle, then hash the final saved file so the next
-    # opener can detect whether their local Proton Drive copy has synced.
-    time.sleep(1)
-    file_hash = _hash_file_with_retry(excel_path)
-
-    # Release the server lock, retrying on transient network failures
-    while True:
-        try:
-            delete_lock(server_url, api_key, lock_id, file_hash=file_hash)
+        # Release the server lock, retrying on transient network failures.
+        # Passing our token means the server refuses if the lease already
+        # lapsed and the file passed to someone else -- in which case there is
+        # nothing of ours left to release.
+        if lost.is_set():
             return
-        except Exception:
-            time.sleep(10)
+        deadline = time.monotonic() + 300
+        while True:
+            try:
+                if not delete_lock(server_url, api_key, lock_id, file_hash, token):
+                    lost.set()
+                return
+            except Exception:
+                if time.monotonic() > deadline:
+                    # Give up rather than spin forever: the lease stops being
+                    # renewed the moment this thread returns, so the server
+                    # frees the lock on its own within minutes.
+                    return
+                time.sleep(10)
+    finally:
+        # Stops the heartbeat, whatever happened above. Nothing may renew a
+        # lease once we are no longer watching the file.
+        stop.set()
 
 
 # ---------------------------------------------------------------------------
@@ -533,24 +683,66 @@ def _show_locked_dialog(root: tk.Tk, status: dict) -> str:
 # Core acquire-and-open flow
 # ---------------------------------------------------------------------------
 
-def _do_acquire_and_open(server_url: str, api_key: str, name: str, excel_path: Path, lock_id: str) -> bool:
+def _do_acquire_and_open(
+    root: tk.Tk, server_url: str, api_key: str, name: str, excel_path: Path, lock_id: str
+) -> bool:
     """
-    Acquires the server lock, opens the file, starts the file watcher, and
-    blocks until the file is closed (watcher releases the lock). Returns False
-    if the lock was already taken (409).
+    Acquires the server lock, opens the file, starts the file watcher and the
+    lease heartbeat, and blocks until the file is closed (watcher releases the
+    lock). Returns False if the lock was already taken (409).
     """
-    if not post_lock(server_url, api_key, name, lock_id):
+    # Identifies this launcher run to the server, so our heartbeats and our
+    # release can only ever affect the lock this run took.
+    token = uuid.uuid4().hex
+
+    if not post_lock(server_url, api_key, name, lock_id, token):
         return False
+
+    # We hold the lock, so nobody else can legitimately have the workbook
+    # open. Any ~$ file still sitting here is a leftover -- clear it, or Excel
+    # will offer us read-only and the watcher will wait on it forever.
+    clear_orphan_owner_file(excel_path)
 
     _open(excel_path)
 
-    t = threading.Thread(
+    stop = threading.Event()
+    lost = threading.Event()
+
+    watcher = threading.Thread(
         target=_watch_and_release,
-        args=(excel_path, server_url, api_key, lock_id),
+        args=(excel_path, server_url, api_key, lock_id, token, stop, lost),
         daemon=True,
     )
-    t.start()
-    t.join()  # Keep the process alive until the file watcher releases the lock
+    heart = threading.Thread(
+        target=_heartbeat_loop,
+        args=(server_url, api_key, lock_id, token, stop, lost),
+        daemon=True,
+    )
+    watcher.start()
+    heart.start()
+
+    # Keep the process alive until the watcher releases the lock. Pumping the
+    # event loop rather than joining outright means we can still put a dialog
+    # on screen from here if the lease is lost.
+    warned = False
+    while watcher.is_alive():
+        if lost.is_set() and not warned:
+            warned = True
+            messagebox.showwarning(
+                "LockLauncher — Lock Lost",
+                f"Your lock on {excel_path.name} was released because this\n"
+                "computer stopped reaching the server, and someone else may\n"
+                "now be editing it.\n\n"
+                "Save your work to a copy rather than over the shared file,\n"
+                "or you may overwrite their changes.",
+            )
+        try:
+            root.update()
+        except tk.TclError:
+            break
+        time.sleep(0.2)
+
+    stop.set()
     return True
 
 
@@ -645,7 +837,7 @@ def main() -> None:
                 sys.exit(0)
 
             try:
-                acquired = _do_acquire_and_open(server_url, api_key, name, excel_path, lock_id)
+                acquired = _do_acquire_and_open(root, server_url, api_key, name, excel_path, lock_id)
             except Exception as e:
                 messagebox.showerror("LockLauncher — Could Not Acquire Lock", _describe_error(e, server_url))
                 sys.exit(1)
@@ -686,7 +878,7 @@ def main() -> None:
                 sys.exit(0)
 
             try:
-                acquired = _do_acquire_and_open(server_url, api_key, name, excel_path, lock_id)
+                acquired = _do_acquire_and_open(root, server_url, api_key, name, excel_path, lock_id)
             except Exception as e:
                 messagebox.showerror("LockLauncher — Could Not Acquire Lock", _describe_error(e, server_url))
                 sys.exit(1)

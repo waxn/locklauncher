@@ -309,9 +309,30 @@ wrong, or the PC has no internet.
 doesn't match the one on the server. Re-check with `cat ~/locklauncher/.env` on
 the server, fix `config.ini`, and rebuild the `.exe`.
 
-**The file shows as locked but nobody has it open** — this can happen if
-someone's computer crashed or was shut off before LockLauncher could free the
-file. Use **Release Lock & Open** to clear it.
+**The file shows as locked but nobody has it open** — wait about five minutes
+and it clears itself. While someone has the file open, their LockLauncher
+checks in with the server every minute; if their computer crashes, gets shut
+off, loses its connection, or the launcher is closed, the check-ins stop and
+the server frees the file on its own. You don't have to do anything. If you
+don't want to wait, **Release Lock & Open** still clears it instantly.
+
+To see exactly what the server is holding, how long since the holder last
+checked in, and whether it has already been freed:
+
+```bash
+./scripts/status.sh http://<vps-ip>:47291 <api-key>
+```
+
+To change the five-minute window, add `LOCK_STALE_MINUTES=5` (or your preferred
+value) to `~/locklauncher/.env` on the server and run
+`systemctl restart locklauncher`. Keep it at several times the one-minute
+check-in interval, so a brief internet hiccup can't free a file someone is
+actively editing.
+
+**"Your lock was released…"** — this appears if your PC couldn't reach the
+server for several minutes while you had the file open. Someone else may have
+taken it in the meantime, so save your work to a new copy rather than over the
+shared file, then merge it in once you can see who changed what.
 
 **Opening Budget also locks Sales (or vice-versa)** — the two files have the
 same `id` in their `config.ini`. Give each file a unique `id`, rebuild both, and
@@ -319,7 +340,9 @@ hand out the new versions. See the note in [Part 2, Step 2](#step-2--edit-the-se
 
 **The "Syncing" window never opens the file** — Proton Drive may be stuck. Make
 sure the Proton Drive app is running and signed in on both PCs and the folder
-shows as fully synced (not "syncing…").
+shows as fully synced (not "syncing…"). If the folder really is synced and the
+window still won't clear, use **Open Anyway** — and see the note on stale
+fingerprints below, which the server now avoids creating.
 
 ---
 
@@ -333,13 +356,55 @@ file paths are ever sent to it.
 |--------|-----------|-------------|----------------------------------------|---------|
 | GET    | `/health` | none        | —                                      | Liveness check |
 | GET    | `/status` | none        | `?lock_id=budget`                      | Who holds this file's lock |
-| POST   | `/lock`   | `X-API-Key` | `{"name": "Alice", "lock_id": "budget"}` | Take the lock (409 if already held) |
-| DELETE | `/lock`   | `X-API-Key` | `{"lock_id": "budget", "hash": "…"}`   | Release; `hash` is remembered as `last_hash` |
+| POST   | `/lock`   | `X-API-Key` | `{"name": "Alice", "lock_id": "budget", "token": "…"}` | Take the lock (409 if already held) |
+| DELETE | `/lock`   | `X-API-Key` | `{"lock_id": "budget", "hash": "…", "token": "…"}` | Release; `hash` is remembered as `last_hash`. With a `token`, refused (409) if the lock has passed to someone else; without one, it is the deliberate override behind **Release Lock & Open** |
+| POST   | `/heartbeat` | `X-API-Key` | `{"lock_id": "budget", "token": "…"}` | Renew the lease (409 if the lock is no longer yours) |
+| GET    | `/locks`  | `X-API-Key` | —                                      | Every lock, with ages, heartbeat age, and whether it lapsed |
 
 `lock_id` defaults to `default` if a client doesn't send one, so older builds
-keep working. The `last_hash` is a SHA-256 fingerprint of the file recorded on a
+keep working. `/status` is unauthenticated and never returns the `token`. The `last_hash` is a SHA-256 fingerprint of the file recorded on a
 clean close; the next opener compares their local copy against it to detect a
 lagging Proton Drive sync (that's what powers the "Syncing" window).
+
+**Locks are leases, not flags.** A lock is normally released by the launcher
+process that took it, which stays running in the background the whole time the
+file is open. If that process dies first — reboot, sign-out, antivirus, an
+unmounted drive — nothing is left to send the release, and under a plain
+lock-flag design the file would stay locked forever.
+
+So the holder instead renews its claim: `POST /heartbeat` every
+`HEARTBEAT_SECONDS` (60) for as long as the file is open, and the server
+honours the lock only while those keep arriving. After `LOCK_STALE_MINUTES`
+(default 5) of silence the lock is reported as free. Nothing has to notice the
+holder died; the lock simply stops being renewed.
+
+Each run sends a random `token` with its lock, and must present it to renew or
+release. That stops a watcher thread left over from an earlier run — one whose
+lease already lapsed and passed to someone else — from renewing or releasing a
+lock that is no longer its own.
+
+`LOCK_TTL_HOURS` (default 8) remains only as a fallback for locks taken by a
+client too old to send heartbeats; nothing uses it once both machines are
+updated.
+
+**Orphaned `~$` files.** Excel keeps its `~$<filename>` owner file open for as
+long as the workbook is, and deletes it on close. A crash — or a cloud sync
+that re-creates the file after Excel removed it — can leave one behind, and a
+leftover does double damage: Excel sees it and offers the next person
+read-only, and the watcher below waits forever for a file that will never
+disappear. Because Excel holds that file with write sharing denied, one we can
+open for writing ourselves is provably an orphan. LockLauncher clears such a
+file before opening the workbook, and treats one that stays unheld for 30
+seconds mid-session as a closed session rather than waiting on it.
+
+**Why a release without a hash clears `last_hash`.** A clean close sends the
+fingerprint of the file that was just saved. A forced release — the **Release
+Lock & Open** button, or an expiry — sends none, and by then the file has almost
+certainly been edited since the stored fingerprint was taken. Keeping that
+fingerprint would leave the next opener comparing their copy against bytes that
+no longer exist anywhere, so the "Syncing" window would wait forever for a sync
+that had already finished. The server clears it instead, which just skips the
+sync check for one open.
 
 **How releasing works under the hood:** Excel creates a hidden lock file named
 `~$<filename>` while a file is open and deletes it on close. LockLauncher
@@ -351,4 +416,11 @@ Check status from your own machine any time:
 
 ```bash
 ./scripts/status.sh http://<vps-ip>:47291
+```
+
+Or, with the API key, see every lock at once along with its age and whether the
+server already considers it expired:
+
+```bash
+./scripts/status.sh http://<vps-ip>:47291 <api-key>
 ```
